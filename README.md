@@ -80,4 +80,4 @@ The pipeline is confirmed working end to end. Test events for 4624 and 4688 have
 
 ## Troubleshooting journal
 
-Building this lab surfaced several non-obvious issues, from a corrupted detection query that failed silently, to domain controller clock drift breaking Azure authentication. A full writeup is in [`docs/troubleshooting-journal.md`](docs/troubleshooting-journal.md).
+Building this lab surfaced several non-obvious issues, from a corrupted detection query that failed silently, to domain controller clock drift breaking Azure authentication.
