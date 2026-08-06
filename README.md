@@ -32,10 +32,6 @@ layer and would never appear in a native Azure VM setup.
 
 ## Architecture
 
-![Architecture diagram](docs/screenshots/architecture.png)
-<!-- SCREENSHOT: a rendered architecture diagram (draw.io / Excalidraw) of the flow below.
-     Optional but recommended; the ASCII version stays as a fallback. -->
-
 ```
 [ Kali Linux VM ] --(attacks/simulation)--> [ Windows Server 2025 DC ]
                                                        |
