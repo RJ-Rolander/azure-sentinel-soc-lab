@@ -1,292 +1,273 @@
-# Azure Sentinel SOC Home Lab
+# Troubleshooting Journal
 
-A hybrid, on-premises-to-cloud SOC lab for practicing detection engineering and incident
-response with Microsoft Sentinel. A locally virtualized Windows Server 2025 domain
-controller is connected to Azure through Azure Arc, security events flow into a Log
-Analytics workspace, and four custom scheduled analytics rules generate and correlate
-incidents in Microsoft Sentinel.
-
-The lab covers the full path: hybrid onboarding, log source configuration, custom
-detections mapped to MITRE ATT&CK, attack simulation, and incident lifecycle. Phase 2
-adds an AI-augmented triage layer on top of the working SIEM.
-
-![Sentinel incident queue](docs/screenshots/incident-queue.png)
-<!-- SCREENSHOT: the Incidents queue showing incidents across all four rule types
-     (Brute Force, Privileged Group, Suspicious PowerShell, New Account Elevated).
-     Redact tenant/subscription/workspace IDs and the assignee email. -->
+This lab did not go together cleanly on the first try. Documenting the real problems here,
+since diagnosing them was arguably more instructive than the parts that worked as expected.
 
 ---
 
-## Why Hybrid, Not a Native Azure VM
+## 1. AD DS Role Installed Silently Incomplete
 
-Most beginner Sentinel labs spin up a Windows VM directly inside Azure. This lab instead
-runs the domain controller locally in VirtualBox and connects it to Azure through Azure
-Arc, which is closer to how many real organizations onboard on-premises or non-Azure
-infrastructure into a cloud SIEM. It also exercises the Arc registration, authentication,
-and agent troubleshooting layer that a pure Azure-VM lab skips entirely. Several of the
-hardest problems in this lab, documented in the
-[troubleshooting journal](docs/troubleshooting-journal.md), came directly from that Arc
-layer and would never appear in a native Azure VM setup.
+The Add Roles and Features wizard appeared to freeze during AD DS installation. After a
+hard reset, Server Manager showed the role installed and offered to promote the server to
+a domain controller, but the promotion wizard failed with:
+
+```
+Test-_InternalADDSVerifyForestName is not recognized.
+```
+
+Running `Get-WindowsFeature AD-Domain-Services` from PowerShell revealed the role was not
+actually installed, despite what the GUI implied. The freeze during installation had left
+things in a broken partial state.
+
+**Fix:**
+```powershell
+Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools
+Get-WindowsFeature AD-Domain-Services  # confirm installed
+```
+
+Then retried the promotion wizard, which completed successfully once the role was actually
+present.
+
+**Takeaway:** GUI wizards can report success based on a step completing its own internal
+logic without confirming the underlying feature state. When something freezes mid-install,
+verify from PowerShell rather than trusting the GUI's next screen.
 
 ---
 
-## Architecture
+## 2. Azure Arc Onboarding Stuck on Biometric Prompt
 
-![Architecture diagram](docs/screenshots/architecture.png)
-<!-- SCREENSHOT: a rendered architecture diagram (draw.io / Excalidraw) of the flow below.
-     Optional but recommended; the ASCII version stays as a fallback. -->
+Running the generated onboarding script triggered an embedded browser popup inside the VM
+asking for a face, fingerprint, PIN, or security key. Since the VM has no biometric
+hardware, this could never succeed regardless of how many times it was retried.
 
-```
-[ Kali Linux VM ] --(attacks/simulation)--> [ Windows Server 2025 DC ]
-                                                       |
-                                                 Azure Arc Agent
-                                                       |
-                                            Azure Monitor Agent (AMA)
-                                                       |
-                                            Data Collection Rule (DCR)
-                                                       |
-                                           Log Analytics Workspace
-                                                       |
-                                            Microsoft Sentinel (SIEM)
-```
-
-### Components
-
-| Component | Role |
-|---|---|
-| Windows Server 2025 (VirtualBox) | Domain controller for `soclab.local`, primary log source |
-| Kali Linux (VirtualBox) | Attacker/simulation host |
-| VirtualBox NAT Network | Shared network allowing both VMs to communicate and reach the internet independently |
-| Azure Arc | Registers the on-premises DC as a manageable Azure resource |
-| Azure Monitor Agent (AMA) | Installed via Arc extension; reads Windows Event Logs and forwards them |
-| Data Collection Rule (DCR) | Defines exactly which events AMA collects and forwards |
-| Log Analytics Workspace | Central store for all collected log data |
-| Microsoft Sentinel | SIEM layer for querying, detection rules, and incident management |
-
-Microsoft Sentinel now runs in the Microsoft Defender portal. The Azure portal Sentinel
-experience is being retired, and this lab was migrated to and operated from the unified
-Defender portal. Ingestion (Arc, AMA, DCR, Log Analytics) is unchanged by that move.
-
----
-
-## Data Sources Collected
-
-Two Windows Event Log subscriptions are configured on the DCR, each targeting a specific
-log with a custom XPath filter rather than collecting entire log categories wholesale.
-
-**Security log:**
-```
-Security!*[System[(EventID=4624 or EventID=4625 or EventID=4688 or EventID=4720 or EventID=4732 or EventID=4698)]]
-```
-
-**PowerShell Operational log:**
-```
-Microsoft-Windows-PowerShell/Operational!*[System[(EventID=4104)]]
-```
-
-### Event ID Reference
-
-| Event ID | Log | Meaning |
-|---|---|---|
-| 4624 | Security | Successful logon |
-| 4625 | Security | Failed logon attempt |
-| 4688 | Security | Process creation (with command-line auditing enabled) |
-| 4720 | Security | User account created |
-| 4732 | Security | Member added to a security-enabled local group |
-| 4698 | Security | Scheduled task created |
-| 4104 | PowerShell Operational | Script block logging (captures deobfuscated PowerShell content) |
-
-These event types cover the core arc of a typical intrusion: initial access attempts
-(4624/4625), attacker execution once inside (4688, 4104), and common persistence or
-privilege escalation actions (4698, 4720, 4732). Collecting only these IDs keeps ingestion
-lean and avoids the noise and cost of collecting the entire Security log.
-
-One schema detail worth noting: the DCR routes both event log subscriptions into the
-`SecurityEvent` table, so 4104 PowerShell Operational events land there rather than in the
-`Event` table. That is not the default routing, and it affects how the PowerShell detection
-is written. See troubleshooting entry 9.
-
----
-
-## Prerequisites Configured on the Domain Controller
-
-A fresh Windows Server install does not audit everything needed for the above event IDs to
-fire. The following were configured explicitly:
+**Fix:** The default `azcmagent connect` login flow attempts interactive/WAM-based
+authentication on Windows, which opens this embedded browser. Adding `--use-device-code`
+forces the older device code flow instead, which prints a code and a URL directly in the
+console. That URL is opened in a normal browser on a separate device where the actual
+sign-in happens, and the VM picks up the completed authentication automatically.
 
 ```powershell
-# Required for 4688 to generate
-auditpol /set /subcategory:"Process Creation" /success:enable
-
-# Required for 4698
-auditpol /set /subcategory:"Other Object Access Events" /success:enable /failure:enable
+azcmagent connect --use-device-code ...
 ```
-
-**Local Group Policy:**
-- `Computer Configuration > Administrative Templates > System > Audit Process Creation > Include command line in process creation events` — **Enabled** (without this, 4688 fires but the CommandLine field is blank)
-- `Computer Configuration > Administrative Templates > Windows Components > Windows PowerShell > Turn on PowerShell Script Block Logging` — **Enabled** (source of event 4104)
-
-Logon/logoff and account management auditing were already enabled by default on a fresh
-domain controller promotion.
 
 ---
 
-## Detections
+## 3. "Invalid Change Token" Error Connecting to Azure
 
-Four production-shaped scheduled analytics rules run against the `SecurityEvent` table.
-Each has a threshold, mapped entities, a MITRE technique, and a documented false-positive
-profile. Full writeup in [docs/detections.md](docs/detections.md); the raw queries are in
-[detections/](detections).
+Once the device code flow was working, connection attempts consistently failed with:
 
-| Rule | Technique | Tactic | Severity |
-|---|---|---|---|
-| Multiple Failed Logons from Single Source | T1110 Brute Force | Credential Access | Medium |
-| Account Added to Privileged Group | T1098 Account Manipulation | Persistence, Priv Esc | High |
-| Suspicious PowerShell Command Line Execution | T1059.001, T1027 | Execution, Defense Evasion | Medium |
-| New Account Created and Rapidly Elevated | T1136.001, T1098 | Persistence, Priv Esc | High |
-
-![Analytics rule entity mapping](docs/screenshots/entity-mapping.png)
-<!-- SCREENSHOT: the Alert enhancement > Entity mapping panel on one rule, showing
-     IP/Host/Account/Process mapped to query columns. -->
-
-### Featured: multi-stage correlation
-
-The strongest detection in the lab is **New Account Created and Rapidly Elevated**. Instead
-of alerting on a single event, it joins two distinct event IDs, account creation (4720) and
-privileged group addition (4732), and fires only when the same account is created and then
-elevated within one hour on the same host.
-
-The join key is the account **SID** (`TargetSid` on 4720, `MemberSid` on 4732), not the
-username. That choice is the point of the rule: 4732 does not carry the member name
-reliably, so joining on name would miss the correlation. The output includes
-`MinutesToElevation`, quantifying how fast the elevation happened. In the sample below the
-account went from created to Administrators in about one minute.
-
-![Correlation incident graph](docs/screenshots/correlation-incident.png)
-<!-- SCREENSHOT: incident ID 13 (New Account Created and Rapidly Elevated), Resolved /
-     True positive, showing the incident graph with the account and host nodes connected. -->
-
-Query: [detections/04-new-account-rapidly-elevated.kql](detections/04-new-account-rapidly-elevated.kql)
-
----
-
-## Attack Simulation
-
-The Kali Linux VM sits on the same VirtualBox NAT Network as the domain controller, giving
-it direct network access while keeping independent internet connectivity.
-
-Tools:
-
-- **netexec (nxc)** — SMB credential brute force to generate 4625 failed logon events
-- **impacket-psexec** — remote execution over SMB to generate 4688 process creation events (blocked by Defender, but the attempt is logged)
-- **evil-winrm** — WinRM remote PowerShell shell for interactive command execution
-- **Local PowerShell / cmd (fallback)** — direct execution on the DC to generate specific event IDs when remote execution is blocked
-
-### Simulated event generation
-
-Network attack, run from Kali:
-```bash
-# 4625 - failed logons (brute force). Spraying a nonexistent user still logs 4625
-# and avoids locking out the real Administrator.
-nxc smb <DC_IP> -u nonexistentuser -p 'x1' 'x2' 'x3' 'x4' 'x5' 'x6'
+```
+error connecting machine to Azure: invalid change token
 ```
 
-Local actions, run on the DC:
+This occurred after the Arc resource had already been created in Azure.
+
+**Root cause:** `w32tm /query /status` showed the domain controller's clock source was
+`Local CMOS Clock` at Stratum 1, meaning it was treating its own internal hardware clock
+as authoritative rather than syncing to any external time source. The VM had sat powered
+off over a weekend, and VirtualBox VM clocks drift meaningfully during extended shutdowns.
+Azure's certificate-based Arc authentication is time-sensitive; even a few minutes of
+drift can break it.
+
+**Fix:**
 ```powershell
-# 4720 then 4732 - new account, then elevation (triggers the correlation rule)
-net user LabAttacker P@ssw0rd123! /add
-net localgroup Administrators LabAttacker /add
-
-# 4688 - suspicious command line. Decodes to Get-Process; harmless, exercises
-# multiple match terms. The hidden window is expected to flash and close.
-powershell.exe -nop -w hidden -EncodedCommand RwBlAHQALQBQAHIAbwBjAGUAcwBzAA==
-
-# 4698 - scheduled task persistence
-schtasks /create /tn "LabTest" /tr "calc.exe" /sc once /st 00:00 /f
+w32tm /config /manualpeerlist:"time.windows.com,0x8" /syncfromflags:manual /reliable:YES /update
+Restart-Service w32time
+w32tm /resync /force
 ```
 
-In a real intrusion all of this would originate from the attacker host. Running the local
-actions directly on the DC is the reliable way to generate those specific event IDs in a
-lab without a full remote-exec foothold, which is the documented fallback pattern.
+**Note:** This is specifically necessary on a domain controller. Promoting a server to the
+forest root PDC disables the normal manual time-sync toggle in Settings in favor of the
+domain's own time hierarchy, which does not automatically point anywhere external on a
+freshly created single-DC forest.
 
 ---
 
-## Incident Lifecycle
+## 4. HTTP 401 "Failed to Create Resource" After Fixing the Clock
 
-Incidents are worked end to end in the Defender portal: assign, set active, investigate
-using the mapped entities and custom details, classify, and close with a written
-justification. The correlation incident below was worked by hand and closed as a true
-positive, which serves as the human-authored baseline the Phase 2 AI triage output is
-measured against.
+After correcting the clock and deleting the partially created Arc resource, a fresh
+connection attempt failed with a plain 401 during resource creation.
 
-![Resolved incident](docs/screenshots/incident-resolved.png)
-<!-- SCREENSHOT: a resolved, classified incident with the investigation comment visible. -->
+**Root cause:** The Azure account in use is a personal Microsoft account rather than one
+tied to an explicit organizational tenant. `azcmagent connect` can resolve to the wrong
+tenant context when none is specified, especially after several prior partial
+connect/disconnect attempts.
 
----
+**Fix:**
+```powershell
+# Clear local agent state from prior attempts
+azcmagent disconnect --force-local-only
 
-## Current Status
-
-- Hybrid Arc onboarding complete, DC reporting to Sentinel via AMA
-- Seven event IDs confirmed ingested and queryable
-- Four scheduled analytics rules live, entity-mapped, MITRE-tagged
-- Incidents generating across all four rule types, including multi-stage correlation
-- Full incident lifecycle practiced and documented
-- Phase 2 (AI triage) in progress
-
-Sample ingestion counts from a validation run:
-
-| Event ID | Count | Status |
-|---|---|---|
-| 4688 | 507 | Confirmed |
-| 4624 | 246 | Confirmed |
-| 4104 | 69 | Confirmed |
-| 4625 | 6+ per run | Confirmed |
-| 4698 | 2 | Confirmed |
-| 4720 | 1+ per run | Confirmed |
-| 4732 | 1+ per run | Confirmed |
-
----
-
-## Phase 2: AI-Augmented Incident Triage
-
-In progress. Pulls Sentinel incidents through the REST API, enriches each with the
-surrounding Windows event telemetry, sends the bundle to an LLM for structured triage
-(summary, attack narrative, MITRE mapping with cited evidence, suggested verdict,
-recommended actions), and writes the result back as an incident comment.
-
-The differentiator is measurement. Because the attacks were generated deliberately, the
-correct MITRE technique for every incident is known, so the model's technique mapping can
-be scored with precision and recall against ground truth rather than eyeballed. The
-pipeline labels AI output as automated and unverified and never auto-closes incidents.
-
-Design and methodology: [docs/phase2-ai-triage.md](docs/phase2-ai-triage.md)
-
----
-
-## Repository Layout
-
-```
-README.md                          Overview (this file)
-detections/                        Raw KQL for the four analytics rules
-docs/
-  detections.md                    Detection-engineering writeup per rule
-  phase2-ai-triage.md              Phase 2 goal, architecture, eval methodology
-  troubleshooting-journal.md       Nine documented problems, root causes, fixes
-  screenshots/                     Portal captures referenced above
+# Reconnect with explicit tenant ID from Entra ID overview page
+azcmagent connect --tenant-id <tenant-id-from-portal> ...
 ```
 
 ---
 
-## Troubleshooting
+## 5. Data Collection Rule Silently Rejected Its Own Query
 
-Building this lab surfaced several non-obvious issues. Full writeups with root causes and
-fixes are in [docs/troubleshooting-journal.md](docs/troubleshooting-journal.md).
+Once the domain controller showed as Connected in Azure Arc, no data appeared in the
+SecurityEvent table despite:
+- The Azure Monitor Agent extension showing "Succeeded"
+- The agent process (`MonAgentCore.exe`) running
+- Heartbeat data confirmed flowing into Log Analytics
 
-1. AD DS role installed silently incomplete via GUI wizard
-2. Azure Arc onboarding stuck on biometric prompt inside VM
-3. Invalid change token error due to domain controller clock drift
-4. HTTP 401 during Arc resource creation due to wrong tenant resolution
-5. DCR silently rejecting its own XPath query with no portal-side error
-6. Path assumptions in official documentation not matching actual Arc agent folder names
-7. Analytics rule produced correct results but zero entities (entity mapping not configured)
-8. Azure Monitor Agent has no `AzureMonitorAgent` service on Arc installs
-9. Event 4104 script block text is not in a queryable column
+**Root cause:** Text meant for a separate PowerShell log data source had been accidentally
+merged into the same XPath field as the Security log query, and the combined string was
+also missing a `*` after the log name. The agent's local log at:
+
+```
+C:\Resources\Directory\AMADataStore.<hostname>\Configuration\MonAgentHost.1.log
+```
+
+showed the actual failure:
+
+```
+Error: EventLog - MAEventTable: ErrorCode(15001): The specified query is invalid.
+Message: Invalid query in the event: ... Will skip the query.
+```
+
+None of this appeared as an error anywhere in the Azure portal. The extension showed
+healthy, the DCR showed correctly associated, and the agent itself was completely
+functional. It had simply received an invalid query, logged it locally, and silently
+collected nothing.
+
+**Fix:** Corrected the XPath in the DCR's data source configuration and split the
+PowerShell log into its own separate data source entry. Confirmed the corrected query
+propagated to the agent by inspecting `mcsconfig.latest.xml` directly on the domain
+controller before re-checking Log Analytics.
+
+**Takeaway:** A "healthy" status in the Azure portal only confirms the extension installed
+and the agent is communicating, not that the actual data collection logic is valid. When a
+pipeline looks fully connected but no data arrives, the agent's local configuration and log
+files are the authoritative source of truth, not the portal.
+
+---
+
+## 6. Path Assumptions Across Documentation Versions
+
+Several official troubleshooting steps reference generic paths like:
+
+```
+C:\Resources\Directory\AMADataStore\...
+```
+
+On this Arc-enabled server, the actual folder is suffixed with the hostname
+(`AMADataStore.DC01`), which caused several `Test-Path` checks to return `False` even
+though the agent was correctly configured underneath a differently named folder.
+
+**Fix:** Check the parent directory's actual contents rather than assuming a documented
+path is exact:
+
+```powershell
+Get-ChildItem "C:\Resources\Directory\" | Where-Object { $_.Name -like "AMADataStore*" }
+```
+
+---
+
+## 7. Analytics Rule Produced Correct Results but Zero Entities
+
+After building the four scheduled analytics rules, the first brute-force incident showed
+`Assets (0)` and, on the incident graph, "No entities to display." The Related Events
+table on the same incident showed everything correctly: `IpAddress 10.0.2.6`,
+`Computer DC01.soclab.local`, and the custom details (`FailedCount 6`,
+`TargetedAccounts ["Administrator"]`). The detection fired and the query output was right.
+The incident had no entities.
+
+**Root cause:** Entity mapping was never added to the rules during creation. The rule ran,
+matched, and produced correct rows, but with no entity mapping configured there was nothing
+to bind those rows to as pivotable entities. Entity binding is independent of query output.
+A rule can return perfectly shaped data and still attach zero entities.
+
+**Fix:** Opened each rule (Set rule logic > Alert enhancement > Entity mapping) and added
+the mappings. For the brute-force rule, IP (Address = `IpAddress`) and Host
+(HostName = `Computer`). A related error surfaced while doing this: mapping an Account
+entity with only an `NTDomain` identifier throws
+
+```
+Invalid Identifiers, can be any of the combinations: (FullName) OR (Sid) OR (Name) OR (AadUserId) OR (PUID) OR (ObjectGuid)
+```
+
+`NTDomain` is a qualifier, not a standalone identifier. It has to sit on the same Account
+entity alongside a `Name` (or SID, etc.) as a second identifier, not as its own entity.
+
+Entity mapping binds at alert creation and does not backfill. Existing incidents stayed
+entity-less permanently. Verifying the fix required generating a fresh alert and confirming
+`Assets > 0` on the new incident, not re-checking the old one.
+
+**Takeaway:** "Query returns rows" is not "incident is investigable." Without entity mapping
+an analyst gets no pivotable entities, no automatic enrichment, and no entity-based
+correlation, even though the rule technically worked. Verify entities on a live incident,
+not just query output. This distinction is the difference between writing a query and
+engineering a detection, and it is invisible until an incident is open in front of you.
+
+---
+
+## 8. Azure Monitor Agent Has No `AzureMonitorAgent` Service on Arc Installs
+
+After the DC had been powered off for a day, a health check for the agent service failed:
+
+```
+Get-Service : Cannot find any service with service name 'AzureMonitorAgent'.
+```
+
+The Arc agent (`himds`) was running fine, so Arc itself was healthy and only the monitoring
+layer looked broken.
+
+**Root cause:** There is no standalone `AzureMonitorAgent` Windows service on an
+extension-based (Arc) install. That service name belongs to the standalone MSI installer
+path used on Windows 10/11 clients. On an Arc machine the agent runs as a set of processes,
+not that named service.
+
+**Fix:** Check for the agent processes instead of a service:
+
+```powershell
+Get-Process Mon* -ErrorAction SilentlyContinue
+```
+
+The correct healthy state is four running processes: `MonAgentCore`, `MonAgentHost`,
+`MonAgentLauncher`, and `MonAgentManager`. `MonAgentCore` is the component that collects
+event logs and streams to Log Analytics. All four were present, so the agent was never
+actually broken. The earlier `Events (0)` shown on the portal's data connectors card was
+just the rolling 24-hour window being empty while the VM was off.
+
+**Takeaway:** The same product ships two install paths with two different verification
+steps. A missing service name is not a missing agent. Confirm which install path is in use
+before concluding the agent is down.
+
+---
+
+## 9. Event 4104 Script Block Text Is Not in a Queryable Column
+
+While building the suspicious-PowerShell detection, the plan was to match on 4104 script
+block content. Inspecting an actual 4104 row showed the `Activity` column contains the
+literal string `4104`, not the script. The real PowerShell content sits inside the
+`EventData` column as XML:
+
+```
+<EventData xmlns="http://schemas.microsoft.com/win/2004/08/events/event">...
+```
+
+**Root cause:** On this ingestion schema, PowerShell Operational events routed into the
+`SecurityEvent` table do not get the script block promoted to a first-class column.
+Extracting it requires a regex against `ScriptBlockText` inside the XML, and long scripts
+are chunked across multiple 4104 events, which makes the extract brittle.
+
+Confirmed the routing with:
+
+```kql
+union withsource=SourceTable SecurityEvent, Event
+| where TimeGenerated > ago(24h)
+| where EventID == 4104
+| summarize count() by SourceTable
+```
+
+which returned 4104 only under `SecurityEvent`, with zero rows in `Event`.
+
+**Fix:** Anchored the detection on the 4688 `CommandLine` column instead, which is
+first-class and reliably populated. The 4104-based content rule is kept as a documented
+stretch item rather than the primary detection.
+
+**Takeaway:** Do not assume an event field carries what its name suggests. The `Activity`
+column name implied it held the script; it did not. Inspect a real row before building a
+detection on top of a field.
