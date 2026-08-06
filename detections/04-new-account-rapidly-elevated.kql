@@ -1,0 +1,26 @@
+// New Account Created and Rapidly Elevated
+// MITRE ATT&CK: T1136.001 (Create Account: Local Account) - Persistence
+//               T1098 (Account Manipulation) - Privilege Escalation
+// Scheduled: every 5 minutes, 2 hour lookback (must match the let lookback value)
+// Correlates account creation (4720) with that same account being added to a
+// privileged group (4732) within one hour, on the same host.
+// Join key is the account SID (TargetSid on 4720, MemberSid on 4732), not the
+// username, because 4732 does not carry the member name reliably.
+
+let lookback = 2h;
+let created = SecurityEvent
+    | where TimeGenerated > ago(lookback)
+    | where EventID == 4720
+    | project CreateTime = TimeGenerated, NewAccountSid = TargetSid,
+              NewAccountName = TargetUserName, Creator = SubjectUserName, Computer;
+let elevated = SecurityEvent
+    | where TimeGenerated > ago(lookback)
+    | where EventID == 4732
+    | where TargetUserName in ("Administrators", "Domain Admins")
+    | project AddTime = TimeGenerated, NewAccountSid = MemberSid,
+              GroupName = TargetUserName, Actor = SubjectUserName, Computer;
+created
+| join kind=inner elevated on NewAccountSid, Computer
+| where AddTime between (CreateTime .. (CreateTime + 1h))
+| project TimeGenerated = AddTime, Computer, NewAccountName, NewAccountSid,
+          Creator, GroupName, MinutesToElevation = datetime_diff('minute', AddTime, CreateTime)

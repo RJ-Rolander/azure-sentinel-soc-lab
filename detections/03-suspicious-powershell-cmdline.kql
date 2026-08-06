@@ -1,0 +1,20 @@
+// Suspicious PowerShell Command Line Execution
+// MITRE ATT&CK: T1059.001 (PowerShell) - Execution
+//               T1027 (Obfuscated Files or Information) - Defense Evasion
+// Scheduled: every 5 minutes, 1 hour lookback
+// Built on 4688 CommandLine, a reliably populated column, rather than on 4104
+// script block content, which lives inside the EventData XML on this schema.
+
+SecurityEvent
+| where EventID == 4688
+| where isnotempty(CommandLine)
+| where CommandLine has_any (
+    "-enc", "-EncodedCommand", "-ec ",
+    "-w hidden", "-WindowStyle Hidden",
+    "-nop", "-NoProfile",
+    "IEX", "Invoke-Expression",
+    "DownloadString", "DownloadFile",
+    "FromBase64String",
+    "-ExecutionPolicy Bypass")
+| project TimeGenerated, Computer, Account, AccountUser = TargetUserName,
+          AccountDomain = TargetDomainName, NewProcessName, CommandLine, ParentProcessName

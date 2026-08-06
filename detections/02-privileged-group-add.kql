@@ -1,0 +1,13 @@
+// Account Added to Privileged Group
+// MITRE ATT&CK: T1098 (Account Manipulation) - Persistence, Privilege Escalation
+// Scheduled: every 5 minutes, 1 hour lookback
+// Fires when a member is added to a privileged local or domain group (4732).
+// Maps the actor (SubjectUser), not the added member: on 4732 the member
+// arrives as MemberSid only, MemberName is usually "-".
+
+SecurityEvent
+| where EventID == 4732
+| where TargetUserName in ("Administrators", "Domain Admins", "Enterprise Admins", "Schema Admins")
+| project TimeGenerated, Computer, GroupName = TargetUserName,
+          ActorAccount = SubjectAccount, ActorUser = SubjectUserName,
+          ActorDomain = SubjectDomainName, AddedMemberSid = MemberSid

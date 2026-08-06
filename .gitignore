@@ -1,0 +1,17 @@
+# Secrets and local config - never commit
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+
+# Phase 2 working files
+samples/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS noise
+.DS_Store
+Thumbs.db

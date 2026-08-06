@@ -1,0 +1,16 @@
+// Multiple Failed Logons from Single Source (Brute Force)
+// MITRE ATT&CK: T1110 (Brute Force) - Credential Access
+// Scheduled: every 5 minutes, 1 hour lookback
+// Fires when a single source IP produces 5+ failed logons (4625) in the window.
+
+SecurityEvent
+| where EventID == 4625
+| where IpAddress !in ("-", "127.0.0.1", "::1")
+| summarize
+    FailedCount = count(),
+    StartTime = min(TimeGenerated),
+    EndTime = max(TimeGenerated),
+    TargetedAccounts = make_set(TargetUserName, 10)
+    by IpAddress, Computer
+| where FailedCount >= 5
+| extend TimeGenerated = EndTime
