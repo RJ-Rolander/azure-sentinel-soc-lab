@@ -1,5 +1,6 @@
 requests
 python-dotenv
+anthropic
 
 # Makes Python trust the Windows certificate store instead of only its
 # bundled certifi list. Needed when local software (e.g. antivirus HTTPS
