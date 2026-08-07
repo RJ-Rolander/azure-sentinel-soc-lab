@@ -1,0 +1,8 @@
+requests
+python-dotenv
+
+# Makes Python trust the Windows certificate store instead of only its
+# bundled certifi list. Needed when local software (e.g. antivirus HTTPS
+# scanning) does TLS inspection with a root CA that's trusted by Windows
+# but not by certifi.
+pip-system-certs
