@@ -31,19 +31,30 @@ layer and would never appear in a native Azure VM setup.
 ---
 
 ## Architecture
+```mermaid
+flowchart LR
+    subgraph HOST["Windows Host - VirtualBox"]
+        subgraph NAT["NAT Network - soclab"]
+            KALI["Kali Linux<br/>netexec, impacket-psexec, evil-winrm"]
+            DC["Windows Server 2025 DC<br/>soclab.local<br/>auditpol process creation + cmdline<br/>PowerShell script block logging"]
+        end
+    end
 
-```
-[ Kali Linux VM ] --(attacks/simulation)--> [ Windows Server 2025 DC ]
-                                                       |
-                                                 Azure Arc Agent
-                                                       |
-                                            Azure Monitor Agent (AMA)
-                                                       |
-                                            Data Collection Rule (DCR)
-                                                       |
-                                           Log Analytics Workspace
-                                                       |
-                                            Microsoft Sentinel (SIEM)
+    subgraph AZURE["Azure"]
+        ARC["Azure Arc<br/>Connected Machine Agent"]
+        AMA["Azure Monitor Agent<br/>Arc extension"]
+        DCR["Data Collection Rule<br/>2 XPath-filtered subscriptions"]
+        LAW["Log Analytics Workspace"]
+        SENT["Microsoft Sentinel<br/>Analytics rules, incidents, entities"]
+    end
+
+    KALI -->|"Simulated attacks:<br/>auth, lateral movement, persistence"| DC
+    DC --- ARC
+    ARC --> AMA
+    AMA -->|"Security: 4624, 4625, 4688,<br/>4720, 4732, 4698<br/>PowerShell/Operational: 4104"| DCR
+    DCR --> LAW
+    LAW --> SENT
+    SENT -->|"SecurityEvent, Event"| KQL["KQL detections<br/>MITRE-mapped"]
 ```
 
 ### Components
