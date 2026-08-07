@@ -13,6 +13,9 @@ __pycache__/
 .venv/
 venv/
 
+# Local scratch notes - not for the repo, just a personal pick-up-where-I-left-off note
+PROGRESS.md
+
 # OS noise
 .DS_Store
 Thumbs.db
