@@ -1,7 +1,6 @@
 # Screenshots
 
-Captures referenced by the README and docs. Redact tenant ID, subscription ID, workspace
-ID, and any personal email before committing.
+Captures referenced by the README and docs.
 
 Expected files and what each should show:
 
