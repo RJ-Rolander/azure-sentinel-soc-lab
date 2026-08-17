@@ -16,6 +16,12 @@ QUERY_URL = f"https://api.loganalytics.io/v1/workspaces/{WORKSPACE_ID}/query"
 WINDOW_MINUTES = 30
 ROW_LIMIT = 100
 
+# Privileged-group-membership events (4732 and the domain equivalents 4728/
+# 4756) reference the added member only via MemberSid within a ~1-hour
+# correlation window - they're rare by construction, so a small cap is safe
+# without risking truncation before the row that matters.
+GROUP_EVENT_ROW_LIMIT = 20
+
 
 def _parse_utc(timestamp: str) -> datetime:
     return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
@@ -75,20 +81,79 @@ def strip_null_columns(records: list[dict]) -> list[dict]:
     return [{k: v for k, v in record.items() if k in keys_with_data} for record in records]
 
 
-def enrich_entity(entity: dict, start: datetime, end: datetime) -> list[dict]:
-    predicate = _entity_filter(entity)
-    if predicate is None:
-        return []
-
+def _query_rows(
+    predicate: str, start: datetime, end: datetime, activity_time: datetime, limit: int
+) -> list[dict]:
+    """Run a windowed SecurityEvent query, prioritizing rows closest to the
+    incident's actual activity time rather than the earliest rows in the
+    window. A chronological-ascending take silently drops everything past
+    the row cap - on a noisy host, that cap is often exhausted by
+    unrelated background activity (e.g. agent/service churn) well before
+    the window reaches the incident itself, so the rows that matter most
+    never come back at all."""
     kql = (
         "SecurityEvent\n"
         f"| where TimeGenerated between (datetime({_format_kql_datetime(start)}) .. datetime({_format_kql_datetime(end)}))\n"
         f"| where {predicate}\n"
-        "| order by TimeGenerated asc\n"
-        f"| take {ROW_LIMIT}"
+        f"| extend ActivityDistanceSeconds = abs(datetime_diff('second', TimeGenerated, datetime({_format_kql_datetime(activity_time)})))\n"
+        "| order by ActivityDistanceSeconds asc\n"
+        f"| take {limit}\n"
+        "| project-away ActivityDistanceSeconds\n"
+        "| order by TimeGenerated asc"
     )
     result = run_query(kql)
-    return strip_null_columns(rows_to_dicts(result["tables"][0]))
+    return rows_to_dicts(result["tables"][0])
+
+
+def _resolve_entity_sid(name: str, rows: list[dict]) -> str | None:
+    """Find this Account entity's own SID from its already-fetched
+    telemetry, so a follow-up query can also match privileged-group-
+    membership events. On 4732/4728/4756, the added member is populated as
+    MemberSid only - MemberName is usually blank, and TargetUserName on
+    those events is the *group* name, not the member. So the name-based
+    predicate in _entity_filter can never match these events for the
+    entity being added, no matter how the window or row cap are tuned;
+    the only way to find them is to know the entity's SID and query on
+    MemberSid directly. See docs/detections.md."""
+    for row in rows:
+        if row.get("TargetUserName") == name and row.get("TargetSid"):
+            return row["TargetSid"]
+    for row in rows:
+        if row.get("SubjectUserName") == name and row.get("SubjectUserSid"):
+            return row["SubjectUserSid"]
+    return None
+
+
+def _merge_rows(*row_lists: list[dict]) -> list[dict]:
+    """Combine results from multiple queries into one chronological list,
+    dropping exact duplicate events (the same row can legitimately come
+    back from more than one query)."""
+    merged: dict[tuple, dict] = {}
+    for rows in row_lists:
+        for row in rows:
+            key = (row.get("EventRecordId"), row.get("Computer"), row.get("TimeGenerated"))
+            merged[key] = row
+    return sorted(merged.values(), key=lambda r: r.get("TimeGenerated") or "")
+
+
+def enrich_entity(
+    entity: dict, start: datetime, end: datetime, activity_time: datetime
+) -> list[dict]:
+    predicate = _entity_filter(entity)
+    if predicate is None:
+        return []
+
+    rows = _query_rows(predicate, start, end, activity_time, ROW_LIMIT)
+
+    if entity["kind"] == "Account":
+        sid = _resolve_entity_sid(entity["properties"]["accountName"], rows)
+        if sid is not None:
+            group_rows = _query_rows(
+                f'MemberSid == "{sid}"', start, end, activity_time, GROUP_EVENT_ROW_LIMIT
+            )
+            rows = _merge_rows(rows, group_rows)
+
+    return strip_null_columns(rows)
 
 
 def enrich_bundle(bundle: dict) -> dict:
@@ -96,11 +161,14 @@ def enrich_bundle(bundle: dict) -> dict:
     collect.py bundle, windowed WINDOW_MINUTES before/after the incident's
     activity span."""
     props = bundle["incident"]["properties"]
-    window_start = _parse_utc(props["firstActivityTimeUtc"]) - timedelta(minutes=WINDOW_MINUTES)
-    window_end = _parse_utc(props["lastActivityTimeUtc"]) + timedelta(minutes=WINDOW_MINUTES)
+    first = _parse_utc(props["firstActivityTimeUtc"])
+    last = _parse_utc(props["lastActivityTimeUtc"])
+    window_start = first - timedelta(minutes=WINDOW_MINUTES)
+    window_end = last + timedelta(minutes=WINDOW_MINUTES)
+    activity_time = first + (last - first) / 2
 
     enriched_entities = [
-        {**entity, "telemetry": enrich_entity(entity, window_start, window_end)}
+        {**entity, "telemetry": enrich_entity(entity, window_start, window_end, activity_time)}
         for entity in bundle["entities"]
     ]
 
