@@ -71,7 +71,7 @@ def triage_bundle(bundle: dict) -> dict:
     client = anthropic.Anthropic()
     response = client.messages.create(
         model=MODEL,
-        max_tokens=4096,
+        max_tokens=16000,
         system=SYSTEM_PROMPT_PATH.read_text(encoding="utf-8"),
         messages=[{"role": "user", "content": build_user_message(bundle)}],
         output_config={"format": {"type": "json_schema", "schema": TRIAGE_SCHEMA}},
