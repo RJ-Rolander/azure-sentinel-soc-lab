@@ -271,3 +271,78 @@ stretch item rather than the primary detection.
 **Takeaway:** Do not assume an event field carries what its name suggests. The `Activity`
 column name implied it held the script; it did not. Inspect a real row before building a
 detection on top of a field.
+
+---
+
+## 10. LLM Triage Correctly Flagged Missing Evidence, Which Surfaced Two Enrichment Bugs
+
+Incident 13 ("New Account Created and Rapidly Elevated") is a rule that correlates a 4720
+(account creation) with a 4732 (privileged group addition) within one hour. The first live
+triage run against `incident-13-enriched.json` came back with `T1098` (Account
+Manipulation) at `low` confidence:
+
+```json
+{
+  "technique_id": "T1098",
+  "confidence": "low",
+  "evidence": [
+    "Analytic rule description and alert MitreTechniques field (['T1136','T1098','T1136.001']) assert correlation of 4720 with a 4732 privileged-group-addition event within one hour, but no 4732 EventID for LabAttacker5 is present in the supplied SecurityEvent telemetry to directly confirm the group membership change occurred"
+  ]
+}
+```
+
+The model refused to assert the alert's own "rapidly elevated" claim because the 4732 event
+simply wasn't in the telemetry it was given — exactly the grounding behavior the system
+prompt asks for (don't cite a technique you can't point to evidence for). That refusal was
+the signal that something upstream was broken, not the model being overly cautious.
+
+**Root cause:** Two separate bugs in `enrich.py`, both silent - neither raised an error or
+returned an empty result, they just returned incomplete data that looked plausible:
+
+1. **Name-only entity matching can't see MemberSid-referenced events.** On a 4732 (and the
+   domain equivalents 4728/4756), the added member is populated as `MemberSid` only -
+   `MemberName` is usually blank, and `TargetUserName` on these events is the *group* name,
+   not the member. `enrich.py`'s entity filter matched `Account`, `TargetUserName`, and
+   `SubjectUserName` against the entity's account name - none of which can ever contain the
+   added member's name on this event type. For an entity that represents the account being
+   *added* (LabAttacker5, not the Administrator who added it), no name-based query could
+   ever find it, regardless of window size or row cap.
+
+2. **The 100-row cap, ordered chronologically ascending, was exhausted by noise before
+   reaching the incident's own activity time.** Checked across all 26 enriched bundles: 24
+   of 26 had their capped entity's last returned row timestamped *before* the incident's
+   activity time. For incident 13 specifically, the query window was 60 minutes but the
+   Host entity's 100 returned rows covered only the first 10, entirely consumed by Azure
+   Monitor Agent extension churn and routine service logons - the account creation and
+   elevation, which happened later in the window, were never even queried.
+
+**Fix:** In `enrich_entity`, resolve the entity's own SID from an already-fetched row (the
+4720's `TargetSid`), then issue a follow-up query matching `MemberSid` directly - this
+catches 4732/4728/4756 regardless of which column the original alert happened to key on.
+Separately, replaced the `order by TimeGenerated asc | take 100` row selection with
+ordering by proximity to the incident's activity time, so the row cap prioritizes
+relevance over raw chronology. Re-ran `enrich.py` live against all 26 incidents before the
+30-day Log Analytics retention window closed.
+
+Re-triaging incident 13 against the corrected bundle flipped `T1098` to `high` confidence
+with real evidence:
+
+```json
+{
+  "technique_id": "T1098",
+  "confidence": "high",
+  "evidence": [
+    "EventID 4732 at 2026-08-04T21:44:11Z, MemberSid=S-1-...-1106 (LabAttacker5) added to Builtin\\Administrators, SubjectUserName=SOCLAB\\Administrator (EventRecordId 67871)",
+    "PowerShell ScriptBlock 4104 at 21:44:11.37Z: 'net localgroup Administrators LabAttacker5 /add' (EventRecordId 1199)"
+  ]
+}
+```
+
+**Takeaway:** An eval-backed triage layer surfaced a data-collection bug that would
+otherwise have silently degraded every incident in the dataset. The model didn't "notice a
+bug" - it did exactly what it was asked to do (refuse to assert evidence it wasn't given),
+and that refusal was legible enough to trace back to a real defect two layers down the
+pipeline. Eyeballing a plausible-sounding triage summary would not have caught this; the
+gap only showed up because the system prompt made "I can't verify this from the data"
+a distinct, visible outcome instead of letting the model paper over it. This is the actual
+argument for building the eval discipline instead of just reading the output and moving on.
