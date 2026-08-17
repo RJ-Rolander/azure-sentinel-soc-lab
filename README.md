@@ -1,14 +1,19 @@
 # Azure Sentinel SOC Home Lab
 
-A hybrid, on-premises-to-cloud SOC lab for practicing detection engineering and incident
-response with Microsoft Sentinel. A locally virtualized Windows Server 2025 domain
-controller is connected to Azure through Azure Arc, security events flow into a Log
-Analytics workspace, and four custom scheduled analytics rules generate and correlate
-incidents in Microsoft Sentinel.
+**A hybrid on-prem-to-cloud Microsoft Sentinel SOC lab: four MITRE-mapped detections
+generating real incidents, plus an LLM triage pipeline whose technique mapping is scored
+against ground truth — not eyeballed.**
+
+A locally virtualized Windows Server 2025 domain controller is connected to Azure through
+Azure Arc, security events flow into a Log Analytics workspace, and four custom scheduled
+analytics rules generate and correlate incidents in Microsoft Sentinel. On top of that
+working SIEM, Phase 2 adds an AI-augmented triage pipeline that reads each incident's
+telemetry, produces a structured, evidence-cited assessment, and is evaluated against
+ground truth rather than trusted at face value.
 
 The lab covers the full path: hybrid onboarding, log source configuration, custom
-detections mapped to MITRE ATT&CK, attack simulation, and incident lifecycle. Phase 2
-adds an AI-augmented triage layer on top of the working SIEM.
+detections mapped to MITRE ATT&CK, attack simulation, incident lifecycle, and — Phase 2 —
+automated triage with a real eval.
 
 ![Sentinel incident queue](docs/screenshots/incident-queue.png)
 <!-- SCREENSHOT: the Incidents queue showing incidents across all four rule types
@@ -168,9 +173,12 @@ reliably, so joining on name would miss the correlation. The output includes
 `MinutesToElevation`, quantifying how fast the elevation happened. In the sample below the
 account went from created to Administrators in about one minute.
 
+The same SID-vs-name distinction that makes this KQL rule correct is exactly what a bug in
+the Phase 2 enrichment layer got wrong later — see [below](#the-eval-discriminates).
+
 ![Correlation incident graph](docs/screenshots/correlation-incident.png)
 <!-- SCREENSHOT: incident ID 13 (New Account Created and Rapidly Elevated), Resolved /
-     True positive, showing the incident graph with the account and host nodes connected. -->
+     BenignPositive, showing the incident graph with the account and host nodes connected. -->
 
 Query: [detections/04-new-account-rapidly-elevated.kql](detections/04-new-account-rapidly-elevated.kql)
 
@@ -221,9 +229,10 @@ lab without a full remote-exec foothold, which is the documented fallback patter
 
 Incidents are worked end to end in the Defender portal: assign, set active, investigate
 using the mapped entities and custom details, classify, and close with a written
-justification. The correlation incident below was worked by hand and closed as a true
-positive, which serves as the human-authored baseline the Phase 2 AI triage output is
-measured against.
+justification. The correlation incident below was worked by hand and closed as
+**BenignPositive** — the correct classification for a self-simulated, authorized lab
+account creation, not a genuine compromise — which serves as the human-authored baseline
+the Phase 2 AI triage output is measured against.
 
 ![Resolved incident](docs/screenshots/incident-resolved.png)
 <!-- SCREENSHOT: a resolved, classified incident with the investigation comment visible. -->
@@ -237,7 +246,8 @@ measured against.
 - Four scheduled analytics rules live, entity-mapped, MITRE-tagged
 - Incidents generating across all four rule types, including multi-stage correlation
 - Full incident lifecycle practiced and documented
-- Phase 2 (AI triage) in progress
+- **Phase 2 (AI triage) delivered:** collect → enrich → triage → writeback → eval, scored
+  against ground truth (below)
 
 Sample ingestion counts from a validation run:
 
@@ -255,17 +265,87 @@ Sample ingestion counts from a validation run:
 
 ## Phase 2: AI-Augmented Incident Triage
 
-In progress. Pulls Sentinel incidents through the REST API, enriches each with the
-surrounding Windows event telemetry, sends the bundle to an LLM for structured triage
-(summary, attack narrative, MITRE mapping with cited evidence, suggested verdict,
-recommended actions), and writes the result back as an incident comment.
+Delivered. Five stages, each independently runnable against saved JSON before ever calling
+a live API or spending a token:
 
-The differentiator is measurement. Because the attacks were generated deliberately, the
-correct MITRE technique for every incident is known, so the model's technique mapping can
-be scored with precision and recall against ground truth rather than eyeballed. The
-pipeline labels AI output as automated and unverified and never auto-closes incidents.
+| Stage | File | What it does |
+|---|---|---|
+| Collect | `src/collect.py` | Pulls an incident, its alerts, and its mapped entities from Sentinel via the REST API |
+| Enrich | `src/enrich.py` | For each entity, queries the surrounding `SecurityEvent` telemetry around the incident's activity time |
+| Triage | `src/triage.py` | Sends the enriched bundle to Claude Sonnet 5, which returns structured JSON: summary, chronological attack narrative, MITRE technique mapping with cited evidence, suggested verdict, recommended actions, and open verification gaps |
+| Writeback | `src/writeback.py` | Renders the triage output as the markdown comment it would post to the incident, prefixed as automated/unverified AI triage; live posting is code-complete but gated behind an explicit `--live` flag |
+| Eval | `evals/score.py` | Scores the model's MITRE technique output against each rule's *intended* tags — an objective label set when the detection was built, not a judgment call about what happened to be "present" in a given run |
 
-Design and methodology: [docs/phase2-ai-triage.md](docs/phase2-ai-triage.md)
+Design and methodology: [docs/phase2-ai-triage.md](docs/phase2-ai-triage.md). System prompt:
+[prompts/triage_system.md](prompts/triage_system.md).
+
+### The eval discriminates
+
+The headline result of this project is not an accuracy number — it's that the eval is
+rigorous enough to fail the model when its evidence doesn't hold up, and that rigor caught
+a real bug in the pipeline itself.
+
+Every technique the model cites is independently checked against the incident's actual
+telemetry (`EventRecordId` or `EventID`+timestamp verified to exist in the enriched
+bundle) before it counts as a real finding. A technique ID that happens to match the
+correct answer isn't enough — if the cited evidence doesn't check out, it's scored as
+**ungrounded**, not credited.
+
+That distinction caught something real. The first live triage run on incident 13 (a
+correlation between account creation and privileged-group elevation) came back like this:
+
+| | Before the fix | After the fix |
+|---|---|---|
+| `T1098` confidence | `low` | `high` |
+| `T1098` evidence | *"…no 4732 EventID for LabAttacker5 is present in the supplied SecurityEvent telemetry…"* | *"EventID 4732 at 2026-08-04T21:44:11Z, MemberSid=…-1106 (LabAttacker5) added to Builtin\Administrators… (EventRecordId 67871)"* |
+| Eval verdict | ungrounded — scored as a miss | grounded — scored as a true positive |
+
+The model wasn't wrong to hedge — the elevation event genuinely wasn't in the telemetry it
+was given. Root-caused to two bugs in `enrich.py`: privileged-group events reference the
+added account only by SID (`MemberSid`), never by name, so an entity query matched only on
+account name could never find the escalation event for the account being escalated — the
+same SID-vs-name distinction the KQL detection itself gets right (see
+[above](#featured-multi-stage-correlation)). Separately, a 100-row telemetry cap ordered
+oldest-first was silently exhausted by background noise before the query reached the
+incident's actual activity window, in 24 of 26 already-collected incidents. Both fixed, and
+all 26 incidents re-enriched live against the (ingestion-suspended but still queryable) Log
+Analytics workspace before its 30-day retention window closed. Full writeup, including how
+the eval caught it: [troubleshooting journal, entry 10](docs/troubleshooting-journal.md#10-llm-triage-correctly-flagged-missing-evidence-which-surfaced-two-enrichment-bugs).
+
+### Results
+
+Scored 7 of the 26 collected incidents — one from each of the four detection types, plus
+both correlation incidents, deliberately skipping the nine near-duplicate PowerShell
+incidents that would add cost without adding eval signal. This is a small, hand-picked
+sample, not a claim of broad coverage.
+
+Under strict, automated-only evidence verification: **100% precision, 92% recall** (11 of
+12 rule-intended technique labels found with independently verifiable evidence). The one
+miss is a real, correct finding — cited too thinly (an `EventID` with no timestamp or
+record ID) for the automated checker to verify on its own — confirmed correct by manual
+review and reported as a miss rather than quietly resolved. Full breakdown, scoring rules,
+and the deliberate choice to report the stricter number: [evals/results.md](evals/results.md).
+
+### Example: incident 13, post-fix
+
+```
+T1098 (Account Manipulation) — confidence: high
+Evidence: EventID 4732 at 2026-08-04T21:44:11Z, MemberSid=S-1-...-1106 (LabAttacker5)
+added to Builtin\Administrators, SubjectUserName=SOCLAB\Administrator
+(EventRecordId 67871); PowerShell ScriptBlock 4104 at 21:44:11.37Z:
+'net localgroup Administrators LabAttacker5 /add' (EventRecordId 1199)
+
+Suggested verdict: BenignPositive
+Needs human verification: No explicit ticket, change-request, or exercise-authorization
+artifact is present in the telemetry confirming this was sanctioned activity — the
+BenignPositive assessment currently relies on inference from account/host/tenant naming
+conventions ('LabAttacker5', 'soclab.local', 'rg-soc-lab')
+```
+
+The pipeline never auto-closes an incident or claims certainty it doesn't have — every
+rendered comment (`output/incident-N-comment.md`) opens with a bold "Automated AI Triage —
+Unverified" banner, and the system prompt requires the model to name what it can't confirm
+rather than paper over the gap.
 
 ---
 
@@ -274,12 +354,28 @@ Design and methodology: [docs/phase2-ai-triage.md](docs/phase2-ai-triage.md)
 ```
 README.md                          Overview (this file)
 detections/                        Raw KQL for the four analytics rules
+prompts/
+  triage_system.md                 System prompt for the Phase 2 triage model
+src/
+  auth.py                          Client-credentials OAuth2 for management.azure.com and api.loganalytics.io
+  collect.py                       Pull incident + alerts + entities from Sentinel
+  enrich.py                        Attach surrounding SecurityEvent telemetry per entity
+  triage.py                        Structured LLM triage call (Claude Sonnet 5)
+  writeback.py                     Render triage output as a Sentinel incident comment
+evals/
+  ground_truth.json                Each detection rule's intended MITRE technique tags
+  score.py                         Reusable technique precision/recall scorer
+  results.md                       Latest eval run: scores, discrimination proof, design notes
+  fixtures/                        Preserved pre-fix triage output, used to prove the eval discriminates
 docs/
   detections.md                    Detection-engineering writeup per rule
   phase2-ai-triage.md              Phase 2 goal, architecture, eval methodology
-  troubleshooting-journal.md       Nine documented problems, root causes, fixes
+  troubleshooting-journal.md       Ten documented problems, root causes, fixes
   screenshots/                     Portal captures referenced above
 ```
+
+`samples/` (collected/enriched incident bundles and triage output) and `output/` (rendered
+incident comments) are gitignored working data, not checked in.
 
 ---
 
@@ -297,3 +393,4 @@ fixes are in [docs/troubleshooting-journal.md](docs/troubleshooting-journal.md).
 7. Analytics rule produced correct results but zero entities (entity mapping not configured)
 8. Azure Monitor Agent has no `AzureMonitorAgent` service on Arc installs
 9. Event 4104 script block text is not in a queryable column
+10. LLM triage correctly flagged missing evidence, which surfaced two enrichment bugs

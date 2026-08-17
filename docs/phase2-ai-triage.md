@@ -1,8 +1,11 @@
 # Phase 2: AI-Augmented Incident Triage
 
-Status: in progress. Detection and incident-generation prerequisites are complete
-(four analytics rules live, incidents generating with mapped entities). This phase adds
-an automated triage layer on top of the working SIEM.
+Status: delivered. The core pipeline - collect, enrich, triage, writeback, eval - is built,
+and the eval has been run against a hand-picked subset of the collected incidents.
+`report.py` remains optional and not yet started (see Components below). Results, the
+scoring methodology, and the key finding (the eval caught a real data-collection bug) are
+in [evals/results.md](../evals/results.md) and summarized in the main
+[README](../README.md#the-eval-discriminates).
 
 ## Goal
 
@@ -42,10 +45,17 @@ mapped entity, the failed logons before a lockout, the process tree around a sus
 command, so the model reasons over evidence instead of a headline.
 
 **Ground-truth evaluation.** Because the attacks in this lab were generated deliberately,
-the correct MITRE technique for every incident is known in advance. That makes it possible
-to measure the model's technique mapping with precision and recall, and its verdict against
-a labeled answer, rather than eyeballing whether the output "looks right." Most LLM-plus-SIEM
-projects skip this. The eval turns the project from a demo into a measured result.
+the correct MITRE technique for every incident is known in advance - each analytics rule's
+own intended tags, not a judgment call about what a given run happened to surface. That
+makes it possible to measure the model's technique mapping with precision and recall
+against a labeled answer, rather than eyeballing whether the output "looks right." Most
+LLM-plus-SIEM projects skip this. Here it did more than turn the project into a measured
+result: scoring incident 13 caught the model correctly refusing to credit a technique its
+telemetry didn't support, which traced back to a real bug in the enrichment layer (see
+[evals/results.md](../evals/results.md) and
+[troubleshooting journal, entry 10](troubleshooting-journal.md#10-llm-triage-correctly-flagged-missing-evidence-which-surfaced-two-enrichment-bugs)).
+An eval that only ever passes isn't proof of anything; this one has a documented case of
+failing the model, which is what makes the passing cases credible.
 
 Ground truth for the simulated scenarios:
 
@@ -68,11 +78,11 @@ reviewer will look for first. The pipeline writes an AI comment labeled as autom
 unverified. It does not auto-close incidents. Auto-classification without a human in the
 loop is the wrong design for this kind of tool.
 
-## Components (planned)
+## Components
 
-- `collect.py` - pull an incident with its alerts and entities into a JSON bundle
-- `enrich.py` - attach surrounding SecurityEvent telemetry per entity
-- `triage.py` - structured LLM call, JSON output against a fixed schema
-- `writeback.py` - render triage to markdown, PUT as an incident comment
-- `report.py` - roll up N triaged incidents into an executive summary
-- `evals/` - ground-truth labels and a scoring script for technique precision/recall
+- `src/collect.py` - **delivered.** Pulls an incident with its alerts and entities into a JSON bundle
+- `src/enrich.py` - **delivered.** Attaches surrounding SecurityEvent telemetry per entity
+- `src/triage.py` - **delivered.** Structured LLM call (Claude Sonnet 5), JSON output against a fixed schema
+- `src/writeback.py` - **delivered.** Renders triage to markdown; live PUT as an incident comment is implemented but gated behind an explicit `--live` flag
+- `evals/` - **delivered.** Ground-truth labels (`ground_truth.json`), a reusable scoring script (`score.py`), and results (`results.md`)
+- `report.py` - **not built.** Optional roll-up of N triaged incidents into an executive summary; may be added later or skipped - the per-incident pipeline and eval are the deliverable, not this
