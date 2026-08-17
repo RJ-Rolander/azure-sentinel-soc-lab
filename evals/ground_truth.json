@@ -1,0 +1,30 @@
+{
+  "8": {
+    "detection": "Multiple Failed Logons from Single Source (Brute Force)",
+    "techniques": ["T1110"]
+  },
+  "2": {
+    "detection": "Account Added to Privileged Group",
+    "techniques": ["T1098"]
+  },
+  "13": {
+    "detection": "New Account Created and Rapidly Elevated",
+    "techniques": ["T1136.001", "T1098"]
+  },
+  "16": {
+    "detection": "New Account Created and Rapidly Elevated",
+    "techniques": ["T1136.001", "T1098"]
+  },
+  "3": {
+    "detection": "Suspicious PowerShell Command Line Execution",
+    "techniques": ["T1059.001", "T1027"]
+  },
+  "4": {
+    "detection": "Suspicious PowerShell Command Line Execution",
+    "techniques": ["T1059.001", "T1027"]
+  },
+  "5": {
+    "detection": "Suspicious PowerShell Command Line Execution",
+    "techniques": ["T1059.001", "T1027"]
+  }
+}
