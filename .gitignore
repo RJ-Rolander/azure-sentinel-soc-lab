@@ -8,6 +8,7 @@ credentials.json
 
 # Phase 2 working files
 samples/
+output/
 __pycache__/
 *.pyc
 .venv/
